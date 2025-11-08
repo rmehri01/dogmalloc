@@ -22,11 +22,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    // The check step makes sure everything compiles and gives us nicer
-    // diagnostics from zls.
-    const check = b.step("check", "Check if dogmalloc compiles");
-    check.dependOn(&exe.step);
-
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
@@ -48,4 +43,10 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // The check step makes sure everything compiles and gives us nicer
+    // diagnostics from zls.
+    const check = b.step("check", "Check if dogmalloc compiles");
+    check.dependOn(&exe.step);
+    check.dependOn(&run_mod_tests.step);
 }
