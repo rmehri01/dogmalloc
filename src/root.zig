@@ -2,10 +2,77 @@
 
 const std = @import("std");
 const log = std.log;
+const testing = std.testing;
 const Thread = std.Thread;
+const Allocator = std.mem.Allocator;
+const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
 const SinglyLinkedList = std.SinglyLinkedList;
 const DoublyLinkedList = std.DoublyLinkedList;
+const PageAllocator = std.heap.PageAllocator;
+
+pub const allocator: Allocator = .{
+    .ptr = undefined,
+    .vtable = &.{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    },
+};
+
+// TODO: deal with threads dying and leaking memory
+// TODO: can probably just make a global like SmpAllocator instead of trying to support separate heaps
+threadlocal var global: Heap = .init();
+
+fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
+    _ = ctx;
+    _ = ra;
+
+    if (isHuge(len, alignment)) {
+        @branchHint(.unlikely);
+        return PageAllocator.map(len, alignment);
+    }
+
+    return global.alloc(len, alignment);
+}
+
+fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
+    _ = ctx;
+    _ = ra;
+
+    if (isHuge(memory.len, alignment)) {
+        @branchHint(.unlikely);
+        if (!isHuge(new_len, alignment)) return false;
+        return PageAllocator.realloc(memory, new_len, false) != null;
+    }
+    // TODO: this is messy
+    if (isHuge(new_len, alignment)) return false;
+
+    return binIndex(wsizeOf(memory.len, alignment)) == binIndex(wsizeOf(new_len, alignment));
+}
+
+fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
+    _ = ctx;
+    _ = ra;
+
+    if (isHuge(memory.len, alignment)) {
+        @branchHint(.unlikely);
+        if (!isHuge(new_len, alignment)) return null;
+        return PageAllocator.realloc(memory, new_len, true);
+    }
+    if (isHuge(new_len, alignment)) return null;
+
+    return if (binIndex(wsizeOf(memory.len, alignment)) == binIndex(wsizeOf(new_len, alignment))) memory.ptr else null;
+}
+
+// TODO: implement free
+fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
+    _ = memory; // autofix
+    _ = alignment; // autofix
+    _ = ctx;
+    _ = ra;
+}
 
 // TODO: use null instead of empty page
 var page_empty: Page = .{
@@ -21,7 +88,8 @@ var page_empty: Page = .{
 const Heap = struct {
     // TODO: what fields actually need to be thread local
     /// Unique id of this thread.
-    tid: Thread.Id,
+    // TODO: add back
+    // tid: ?Thread.Id,
     /// Optimization: array where every entry points to a page with possibly
     /// free blocks in the corresponding queue for that size.
     pages_free_direct: [SMALL_WSIZE_MAX]*Page,
@@ -36,15 +104,14 @@ const Heap = struct {
     // TODO: naming, binhuge vs hugebin
     const EXACT_BINS = 8;
     const BIN_COUNT = BIN_FULL + 1;
-    const BIN_FULL = 48;
+    const BIN_FULL = 36;
 
     /// We never allocate more than PTRDIFF_MAX (see also <https://sourceware.org/ml/libc-announce/2019/msg00001.html>).
     const MAX_ALLOC_SIZE = std.math.maxInt(isize);
 
     fn init() Heap {
-        @compileLog(binIndex(Page.SIZE));
         return .{
-            .tid = std.Thread.getCurrentId(),
+            // .tid = std.Thread.getCurrentId(),
             .pages_free_direct = @splat(&page_empty),
             .pages = comptime pages: {
                 var pages: [BIN_COUNT]PageQueue = undefined;
@@ -65,53 +132,47 @@ const Heap = struct {
     }
 
     /// The main allocation function.
-    fn alloc(self: *Heap, len: usize) ?[*]u8 {
+    fn alloc(self: *Heap, len: usize, alignment: Alignment) ?[*]u8 {
         assert(len > 0);
 
         // fast path for small objects
-        if (len <= SMALL_SIZE_MAX) {
+        const wsize = wsizeOf(len, alignment);
+        if (wsize <= SMALL_WSIZE_MAX) {
             // TODO: how much do these branch hints impact perf
             @branchHint(.likely);
-            return self.allocSmall(len);
-        }
-
-        // huge allocation?
-        if (len > Page.SIZE) {
-            @branchHint(.unlikely);
-            // TODO: proper alignment
-            return std.heap.PageAllocator.map(len, .fromByteUnits(len));
+            return self.allocSmall(wsize);
         }
 
         // regular allocation
-        assert(self.tid == Thread.getCurrentId()); // heaps are thread local
-        return self.allocGeneric(len);
+        // assert(self.tid == Thread.getCurrentId()); // heaps are thread local
+        return self.allocGeneric(wsize);
     }
 
-    fn allocSmall(self: *Heap, len: usize) ?[*]u8 {
-        assert(len <= SMALL_SIZE_MAX);
-        assert(self.tid == Thread.getCurrentId()); // heaps are thread local
+    fn allocSmall(self: *Heap, wsize: usize) ?[*]u8 {
+        assert(wsize <= SMALL_WSIZE_MAX);
+        // assert(self.tid == Thread.getCurrentId()); // heaps are thread local
 
         // get page in constant time, and allocate from it
-        const page = self.getFreeSmallPage(len);
-        return self.allocPage(page, len);
+        const page = self.getFreeSmallPage(wsize);
+        return self.allocPage(page, wsize);
     }
 
-    fn getFreeSmallPage(self: *Heap, len: usize) *Page {
-        assert(len <= SMALL_SIZE_MAX);
-        return self.pages_free_direct[wsizeOf(len) - 1];
+    fn getFreeSmallPage(self: *Heap, wsize: usize) *Page {
+        assert(wsize <= SMALL_WSIZE_MAX);
+        return self.pages_free_direct[wsize - 1];
     }
 
     /// Generic allocation routine if the fast path (`allocPage`) does not succeed.
-    fn allocGeneric(self: *Heap, len: usize) ?[*]u8 {
+    fn allocGeneric(self: *Heap, wsize: usize) ?[*]u8 {
         // TODO: initialize if necessary
         // TODO: do administrative tasks every N generic mallocs
 
         // find (or allocate) a page of the right size
-        const page = self.findPage(len) orelse page: {
+        const page = self.findPage(wsize) orelse page: {
             // first time out of memory, try to collect and retry the allocation once more
             @branchHint(.unlikely);
             self.collectFree(true);
-            const p = self.findPage(len) orelse {
+            const p = self.findPage(wsize) orelse {
                 // out of memory
                 @branchHint(.unlikely);
                 return null;
@@ -120,11 +181,11 @@ const Heap = struct {
         };
 
         assert(page.immediateAvailable());
-        assert(len <= page.block_size);
+        assert(wsize * @sizeOf(usize) <= page.block_size);
         assert(Page.fromPtr(page) == page);
 
         // and try again, this time succeeding! (i.e. this should never recurse)
-        const res = self.allocPage(page, len);
+        const res = self.allocPage(page, wsize);
         assert(res != null);
 
         // TODO: move full pages to full queue
@@ -134,13 +195,13 @@ const Heap = struct {
 
     /// Fast allocation in a page: just pop from the free list.
     /// Fall back to generic allocation only if the list is empty.
-    fn allocPage(self: *Heap, page: *Page, len: usize) ?[*]u8 {
+    fn allocPage(self: *Heap, page: *Page, wsize: usize) ?[*]u8 {
         // TODO: assertions
 
         // pop from the free list
         const node = page.free.popFirst() orelse {
             @branchHint(.unlikely);
-            return self.allocGeneric(len);
+            return self.allocGeneric(wsize);
         };
         const block: [*]u8 = @ptrCast(node);
         page.used += 1;
@@ -151,20 +212,20 @@ const Heap = struct {
     }
 
     /// Allocate a page.
-    fn findPage(self: *Heap, len: usize) ?*Page {
-        if (len > MAX_ALLOC_SIZE) {
+    fn findPage(self: *Heap, wsize: usize) ?*Page {
+        if (wsize * @sizeOf(usize) > MAX_ALLOC_SIZE) {
             @branchHint(.unlikely);
-            log.err("allocation request is too large ({d} bytes)", .{len});
+            log.err("allocation request is too large ({d} bytes)", .{wsize * @sizeOf(usize)});
             return null;
         }
 
-        const pq = self.pageQueue(len);
+        const pq = self.pageQueue(wsize);
         return self.findFreePage(pq);
     }
 
-    fn pageQueue(self: *Heap, len: usize) *PageQueue {
-        const pq = &self.pages[binIndex(len)];
-        assert(@intFromEnum(pq.block_size) <= Page.SIZE);
+    fn pageQueue(self: *Heap, wsize: usize) *PageQueue {
+        const pq = &self.pages[binIndex(wsize)];
+        // assert(@intFromEnum(pq.block_size) <= Page.MAX_OBJ_SIZE);
         return pq;
     }
 
@@ -314,16 +375,15 @@ const Heap = struct {
         const page: *Page = @alignCast(@fieldParentPtr("node", pq.items.first.?));
 
         // find index in the right direct page array
-        const idx = wsizeOf(size) - 1;
+        const idx = wsizeOf(size, .@"1") - 1;
         if (self.pages_free_direct[idx] == page) return; // already set
 
         // find start slot
-        const bin = binIndex(size);
-        // TODO: indexing is sus, same with / vs divCeil
+        const bin = binIndex(wsizeOf(size, .@"1"));
         const start = if (bin == 0) 0 else start: {
             // find previous size
             const prev_size = self.pages[bin - 1].block_size;
-            break :start wsizeOf(@intFromEnum(prev_size));
+            break :start wsizeOf(@intFromEnum(prev_size), .@"1");
         };
 
         // set size range to the right page
@@ -383,18 +443,23 @@ const Page = struct {
     /// Next index to use when extending the `free` pointers to `data`.
     next_idx: u16,
     /// The actual data that `free` points to.
-    // TODO: aligning here is wrong since its not block size
-    data: [DATA_LEN]u8 align(8),
+    data: [DATA_LEN]u8,
 
+    // TODO: these and the page constants need to be cleaned up
     const SIZE = 1 << 16;
     const DATA_LEN = SIZE - (8 + 2 + 8 + 16 + 2);
+    const MAX_OBJ_SIZE = DATA_LEN / 8;
+    // TODO: compute this with wsizeOf?
+    const MAX_OBJ_WSIZE = MAX_OBJ_SIZE / @sizeOf(usize);
+
     /// Heuristic, one OS page seems to work well.
     const MAX_EXTEND = 4 * 1024;
+
     comptime {
         assert(@sizeOf(Page) == SIZE);
         assert(@alignOf(Page) == SIZE);
         assert(SIZE % MAX_EXTEND == 0);
-        assert(binBlockSize(Heap.BIN_FULL - 1) == Page.SIZE);
+        assert(MAX_OBJ_SIZE <= binBlockSize(Heap.BIN_FULL - 1));
     }
 
     fn fromPtr(ptr: *anyopaque) *Page {
@@ -430,15 +495,21 @@ const Page = struct {
         assert(self.next_idx == 0);
 
         const block_size = self.block_size;
-        const block_total = self.data.len / block_size;
+        const off = std.mem.alignPointerOffset(
+            @as([*]u8, &self.data),
+            // TODO: this wastes space, should use next_idx instead
+            std.math.ceilPowerOfTwoAssert(usize, block_size),
+        ).?;
+        const data = self.data[off..];
+        const block_total = data.len / block_size;
         for (0..block_total - 1) |block_num| {
-            const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(&self.data[block_num * block_size]));
-            const next: *SinglyLinkedList.Node = @ptrCast(@alignCast(&self.data[block_num * block_size + block_size]));
+            const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[block_num * block_size]));
+            const next: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[block_num * block_size + block_size]));
             block.next = next;
         }
 
-        const first: *SinglyLinkedList.Node = @ptrCast(@alignCast(&self.data[0]));
-        const last: *SinglyLinkedList.Node = @ptrCast(@alignCast(&self.data[(block_total - 1) * block_size]));
+        const first: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[0]));
+        const last: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[(block_total - 1) * block_size]));
         last.next = self.free.first;
         self.free.first = first;
 
@@ -458,23 +529,26 @@ const PageQueue = struct {
     // TODO: could store this more compactly like in std.mem.Alignment + std.math.IntFittingRange
     const BlockSize = enum(usize) {
         // TODO: should separate out full into separate field?
-        full = Page.SIZE + 1,
+        full = Page.MAX_OBJ_SIZE + 1,
         _,
     };
 };
 
+fn isHuge(len: usize, alignment: Alignment) bool {
+    return wsizeOf(len, alignment) > Page.MAX_OBJ_WSIZE;
+}
+
 /// Return the bin for a given size allocation.
 // TODO: the returned index can be smaller
-fn binIndex(len: usize) usize {
-    assert(len <= Page.SIZE);
+fn binIndex(req_wsize: usize) usize {
+    assert(req_wsize <= Page.MAX_OBJ_WSIZE);
 
-    var wsize = wsizeOf(len);
-    if (wsize <= Heap.EXACT_BINS) {
+    if (req_wsize <= Heap.EXACT_BINS) {
         @branchHint(.likely);
-        return wsize - 1;
+        return req_wsize - 1;
     }
 
-    wsize -= 1;
+    const wsize = req_wsize - 1;
     // find the highest bit
     const b: u6 = @intCast(@bitSizeOf(usize) - 1 - @clz(wsize)); // note: wsize != 0
     // and use the top 3 bits to determine the bin (~12.5% worst internal fragmentation).
@@ -483,7 +557,7 @@ fn binIndex(len: usize) usize {
     // - adjust with 1 because there is no size 0 bin
     const binIdx = ((@as(usize, b) << 2) + ((wsize >> (b - 2)) & 0x03)) - std.math.log2(Heap.EXACT_BINS) - 1;
     assert(0 < binIdx and binIdx < Heap.BIN_FULL);
-    assert(len / @sizeOf(usize) <= binBlockSize(binIdx));
+    assert(req_wsize * @sizeOf(usize) <= binBlockSize(binIdx));
     return binIdx;
 }
 
@@ -505,23 +579,30 @@ fn binBlockSize(binIdx: usize) usize {
 
 /// Align a byte size to a size in _machine words_,
 /// i.e. byte size == `wsize * @sizeOf(usize)`.
-fn wsizeOf(len: usize) usize {
-    return std.math.divCeil(usize, len, @sizeOf(usize)) catch unreachable;
+fn wsizeOf(len: usize, alignment: Alignment) usize {
+    const size = alignment.forward(len);
+    return std.math.divCeil(usize, size, @sizeOf(usize)) catch unreachable;
 }
 
 // TODO: actual tests
 test {
     for (1..100) |i| {
-        std.debug.print("{d} bytes: bin {d}\n", .{ i, binIndex(i * 8) });
+        std.debug.print("{d} bytes: bin {d}\n", .{ i, binIndex(i) });
     }
 
-    var heap = Heap.init();
-    for (heap.pages) |p| {
+    for (global.pages) |p| {
         std.debug.print("{d}\n", .{p.block_size});
     }
 
-    const x = heap.alloc(9 * 128);
-    const y = heap.alloc(9 * 128);
-    const z = heap.alloc(9 * 128);
-    std.debug.print("{any} {any} {any}\n", .{ x, y, z });
+    const x = allocator.alloc(u8, Page.MAX_OBJ_SIZE) catch unreachable;
+    const y = allocator.alloc(u8, 128 * 8) catch unreachable;
+    const z = allocator.alloc(u8, 128 * 8) catch unreachable;
+    std.debug.print("{*} {*} {*}\n", .{ x.ptr, y.ptr, z.ptr });
+}
+
+test "standard allocator tests" {
+    try std.heap.testAllocator(allocator);
+    try std.heap.testAllocatorAligned(allocator);
+    try std.heap.testAllocatorLargeAlignment(allocator);
+    try std.heap.testAllocatorAlignedShrink(allocator);
 }
