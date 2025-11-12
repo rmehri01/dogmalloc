@@ -1,7 +1,7 @@
 //! By convention, root.zig is the root source file when making a library.
 
 const std = @import("std");
-const log = std.log;
+const log = std.log.scoped(.dogmalloc);
 const testing = std.testing;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
@@ -504,7 +504,7 @@ const Page = struct {
         const block_total = data.len / block_size;
         for (0..block_total - 1) |block_num| {
             const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[block_num * block_size]));
-            const next: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[block_num * block_size + block_size]));
+            const next: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[(block_num + 1) * block_size]));
             block.next = next;
         }
 
