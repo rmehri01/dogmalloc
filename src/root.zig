@@ -344,6 +344,10 @@ const Heap = struct {
             .next_idx = 0,
             .data = undefined,
         };
+        page.next_idx = @intCast(std.mem.alignPointerOffset(
+            @as([*]u8, &page.data),
+            @as(usize, 1) << @intCast(@ctz(block_size)),
+        ).?);
 
         // initialize an initial free list
         if (!page.extendFree()) return null;
@@ -473,8 +477,7 @@ const Page = struct {
 
     // Has the page not yet used up to its reserved space?
     fn expandable(self: *const Page) bool {
-        // TODO: dont just initialize whole free list?
-        return self.next_idx == 0;
+        return self.next_idx < self.data.len;
     }
 
     // Is more than 7/8th of the page in use?
@@ -491,16 +494,8 @@ const Page = struct {
         // TODO: assertion
         if (!self.expandable()) return false;
 
-        // TODO: dont just initialize whole free list?
-        assert(self.next_idx == 0);
-
         const block_size = self.block_size;
-        const off = std.mem.alignPointerOffset(
-            @as([*]u8, &self.data),
-            // TODO: this wastes space, should use next_idx instead
-            std.math.ceilPowerOfTwoAssert(usize, block_size),
-        ).?;
-        const data = self.data[off..];
+        const data = self.data[self.next_idx..];
         const block_total = data.len / block_size;
         for (0..block_total - 1) |block_num| {
             const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[block_num * block_size]));
