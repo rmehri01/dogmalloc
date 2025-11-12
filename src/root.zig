@@ -66,16 +66,21 @@ fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra
     return if (binIndex(wsizeOf(memory.len, alignment)) == binIndex(wsizeOf(new_len, alignment))) memory.ptr else null;
 }
 
-// TODO: implement free
 fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
-    _ = memory; // autofix
-    _ = alignment; // autofix
     _ = ctx;
     _ = ra;
+
+    if (isHuge(memory.len, alignment)) {
+        @branchHint(.unlikely);
+        return PageAllocator.unmap(@alignCast(memory));
+    }
+
+    return global.free(memory.ptr);
 }
 
 // TODO: use null instead of empty page
 var page_empty: Page = .{
+    .tid = 0,
     .free = .{},
     .used = 0,
     .block_size = 0,
@@ -87,9 +92,6 @@ var page_empty: Page = .{
 /// A heap owns a set of pages.
 const Heap = struct {
     // TODO: what fields actually need to be thread local
-    /// Unique id of this thread.
-    // TODO: add back
-    // tid: ?Thread.Id,
     /// Optimization: array where every entry points to a page with possibly
     /// free blocks in the corresponding queue for that size.
     pages_free_direct: [SMALL_WSIZE_MAX]*Page,
@@ -111,7 +113,6 @@ const Heap = struct {
 
     fn init() Heap {
         return .{
-            // .tid = std.Thread.getCurrentId(),
             .pages_free_direct = @splat(&page_empty),
             .pages = comptime pages: {
                 var pages: [BIN_COUNT]PageQueue = undefined;
@@ -144,13 +145,29 @@ const Heap = struct {
         }
 
         // regular allocation
-        // assert(self.tid == Thread.getCurrentId()); // heaps are thread local
         return self.allocGeneric(wsize);
+    }
+
+    /// Free a block.
+    fn free(self: *Heap, ptr: *anyopaque) void {
+        _ = self; // autofix
+
+        const page = Page.fromPtr(ptr);
+        const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(ptr));
+        if (page.tid == Thread.getCurrentId()) {
+            // thread-local free
+            @branchHint(.likely);
+            page.free.prepend(block);
+            page.used -= 1;
+            // TODO: free page if used == 0
+        } else {
+            // non-local free
+            // @panic("handle non-local free");
+        }
     }
 
     fn allocSmall(self: *Heap, wsize: usize) ?[*]u8 {
         assert(wsize <= SMALL_WSIZE_MAX);
-        // assert(self.tid == Thread.getCurrentId()); // heaps are thread local
 
         // get page in constant time, and allocate from it
         const page = self.getFreeSmallPage(wsize);
@@ -337,6 +354,7 @@ const Heap = struct {
         // TODO: probably move to page.init()
         const page = std.heap.page_allocator.create(Page) catch return null;
         page.* = .{
+            .tid = Thread.getCurrentId(),
             .free = .{},
             .used = 0,
             .block_size = @intFromEnum(pq.block_size),
@@ -435,6 +453,8 @@ const Heap = struct {
 const Page = struct {
     _: void align(SIZE) = {},
 
+    /// Thread this page belongs to.
+    tid: Thread.Id,
     /// List of available free blocks (`malloc` allocates from this list).
     /// Blocks will be aligned to the greatest power of 2 divisor of `block_size`.
     free: SinglyLinkedList,
@@ -451,7 +471,7 @@ const Page = struct {
 
     // TODO: these and the page constants need to be cleaned up
     const SIZE = 1 << 16;
-    const DATA_LEN = SIZE - (8 + 2 + 8 + 16 + 2);
+    const DATA_LEN = SIZE - (@sizeOf(Thread.Id) + 8 + 2 + 8 + 16 + 2);
     const MAX_OBJ_SIZE = DATA_LEN / 8;
     // TODO: compute this with wsizeOf?
     const MAX_OBJ_WSIZE = MAX_OBJ_SIZE / @sizeOf(usize);
@@ -589,9 +609,12 @@ test {
         std.debug.print("{d}\n", .{p.block_size});
     }
 
-    const x = allocator.alloc(u8, Page.MAX_OBJ_SIZE) catch unreachable;
+    const x = allocator.alloc(u8, 128 * 8) catch unreachable;
+    allocator.free(x);
     const y = allocator.alloc(u8, 128 * 8) catch unreachable;
+    allocator.free(y);
     const z = allocator.alloc(u8, 128 * 8) catch unreachable;
+    allocator.free(z);
     std.debug.print("{*} {*} {*}\n", .{ x.ptr, y.ptr, z.ptr });
 }
 
