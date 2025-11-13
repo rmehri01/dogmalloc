@@ -1,7 +1,6 @@
 //! By convention, root.zig is the root source file when making a library.
 
 const std = @import("std");
-const log = std.log.scoped(.dogmalloc);
 const testing = std.testing;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
@@ -10,6 +9,8 @@ const assert = std.debug.assert;
 const SinglyLinkedList = std.SinglyLinkedList;
 const DoublyLinkedList = std.DoublyLinkedList;
 const PageAllocator = std.heap.PageAllocator;
+
+const log = std.log.scoped(.dogmalloc);
 
 pub const allocator: Allocator = .{
     .ptr = undefined,
@@ -336,8 +337,8 @@ const Heap = struct {
         if (page) |p| {
             // move the page to the front of the queue
             assert(p.immediateAvailable());
-            pq.items.remove(&p.node);
-            pq.items.prepend(&p.node);
+            self.pageQueueRemove(pq, p);
+            self.pageQueuePush(pq, p);
             // TODO retire expire
         } else {
             // TODO: collect retired
@@ -394,9 +395,17 @@ const Heap = struct {
 
     fn pageQueuePush(self: *Heap, pq: *PageQueue, page: *Page) void {
         pq.items.prepend(&page.node);
-        pq.count += 1;
         self.updateDirect(pq);
+        pq.count += 1;
         self.page_count += 1;
+    }
+
+    fn pageQueueRemove(self: *Heap, pq: *PageQueue, page: *Page) void {
+        const was_first = pq.items.first == &page.node;
+        pq.items.remove(&page.node);
+        if (was_first) self.updateDirect(pq);
+        pq.count -= 1;
+        self.page_count -= 1;
     }
 
     /// The current small page array is for efficiency and for each
@@ -409,8 +418,10 @@ const Heap = struct {
         const size = @intFromEnum(pq.block_size);
         if (size > SMALL_SIZE_MAX) return;
 
-        // TODO: is this okay to unwrap
-        const page: *Page = @alignCast(@fieldParentPtr("node", pq.items.first.?));
+        const page: *Page = if (pq.items.first) |node|
+            @alignCast(@fieldParentPtr("node", node))
+        else
+            return;
 
         // find index in the right direct page array
         const idx = wsizeOf(size, .@"1") - 1;
