@@ -99,16 +99,15 @@ const Heap = struct {
     pages_free_direct: [SMALL_WSIZE_MAX]*Page,
     /// Queue of pages for each size class (or "bin").
     pages: [BIN_COUNT]PageQueue,
-    /// Total number of pages in the `pages` queues.
-    page_count: usize,
+    /// Optimization: prevents full pages from being repeatedly searched in
+    /// `pageQueueFindFree`.
+    pages_full: PageQueue,
 
     const SMALL_WSIZE_MAX = 128;
     const SMALL_SIZE_MAX = SMALL_WSIZE_MAX * @sizeOf(usize);
 
-    // TODO: naming, binhuge vs hugebin
     const EXACT_BINS = 8;
-    const BIN_COUNT = BIN_FULL + 1;
-    const BIN_FULL = 36;
+    const BIN_COUNT = 36;
 
     /// We never allocate more than PTRDIFF_MAX (see also <https://sourceware.org/ml/libc-announce/2019/msg00001.html>).
     const MAX_ALLOC_SIZE = std.math.maxInt(isize);
@@ -121,16 +120,16 @@ const Heap = struct {
                 for (0..BIN_COUNT) |bin| {
                     pages[bin] = .{
                         .items = .{},
-                        .count = 0,
-                        .block_size = switch (bin) {
-                            BIN_FULL => .full,
-                            else => @enumFromInt(binBlockSize(bin)),
-                        },
+                        .block_size = binBlockSize(bin),
                     };
                 }
                 break :pages pages;
             },
-            .page_count = 0,
+            .pages_full = .{
+                .items = .{},
+                // TODO: this isn't needed
+                .block_size = 0,
+            },
         };
     }
 
@@ -290,7 +289,7 @@ const Heap = struct {
             // is the local free list non-empty?
             var available = page.immediateAvailable();
             if (!available) {
-                // collect freed blocks by us and other threads to we get a proper use count
+                // collect freed blocks by us and other threads so we get a proper used count
                 page.collectFree(false);
                 available = page.immediateAvailable();
             }
@@ -298,7 +297,7 @@ const Heap = struct {
             // if the page is completely full, move it to `pages_full`
             // queue so we don't visit long-lived pages too often.
             if (!available and !page.expandable()) {
-                // TODO: handle
+                self.moveToFull(pq, page);
             } else {
                 // the page has free space, make it a candidate
                 // we prefer non-expandable pages with high usage as candidates (to reduce commit, and increase chances of free-ing up pages)
@@ -315,7 +314,7 @@ const Heap = struct {
             }
 
             // TODO: if we find a non-expandable candidate, or searched for N pages, return with the best candidate
-            if (available) {
+            if (available or page.expandable()) {
                 assert(candidate != null);
                 break;
             }
@@ -354,8 +353,8 @@ const Heap = struct {
 
     /// Get a fresh page to use.
     fn pageFresh(self: *Heap, pq: *PageQueue) ?*Page {
-        const page = self.pageFreshAlloc(pq, @intFromEnum(pq.block_size)) orelse return null;
-        assert(@intFromEnum(pq.block_size) == page.block_size);
+        const page = self.pageFreshAlloc(pq, pq.block_size) orelse return null;
+        assert(pq.block_size == page.block_size);
         // TODO: assertion
         return page;
     }
@@ -364,7 +363,7 @@ const Heap = struct {
     // TODO: alignment
     fn pageFreshAlloc(self: *Heap, pq: *PageQueue, block_size: usize) ?*Page {
         // TODO: assertion
-        assert(block_size == @intFromEnum(pq.block_size));
+        assert(block_size == pq.block_size);
 
         // TODO: better allocation strategy, return proper oom error
         // TODO: probably move to page.init()
@@ -374,7 +373,7 @@ const Heap = struct {
             .free = .{},
             .thread_free = .init(null),
             .used = 0,
-            .block_size = @intFromEnum(pq.block_size),
+            .block_size = pq.block_size,
             .node = .{},
             .next_idx = 0,
             .data = undefined,
@@ -393,19 +392,20 @@ const Heap = struct {
         return page;
     }
 
+    fn moveToFull(self: *Heap, pq: *PageQueue, page: *Page) void {
+        self.pageQueueRemove(pq, page);
+        self.pages_full.items.append(&page.node);
+    }
+
     fn pageQueuePush(self: *Heap, pq: *PageQueue, page: *Page) void {
         pq.items.prepend(&page.node);
         self.updateDirect(pq);
-        pq.count += 1;
-        self.page_count += 1;
     }
 
     fn pageQueueRemove(self: *Heap, pq: *PageQueue, page: *Page) void {
         const was_first = pq.items.first == &page.node;
         pq.items.remove(&page.node);
         if (was_first) self.updateDirect(pq);
-        pq.count -= 1;
-        self.page_count -= 1;
     }
 
     /// The current small page array is for efficiency and for each
@@ -415,7 +415,7 @@ const Heap = struct {
     /// range of entries in `pages_free_direct`.
     fn updateDirect(self: *Heap, pq: *PageQueue) void {
         // TODO: assertion
-        const size = @intFromEnum(pq.block_size);
+        const size = pq.block_size;
         if (size > SMALL_SIZE_MAX) return;
 
         const page: *Page = if (pq.items.first) |node|
@@ -432,7 +432,7 @@ const Heap = struct {
         const start = if (bin == 0) 0 else start: {
             // find previous size
             const prev_size = self.pages[bin - 1].block_size;
-            break :start wsizeOf(@intFromEnum(prev_size), .@"1");
+            break :start wsizeOf(prev_size, .@"1");
         };
 
         // set size range to the right page
@@ -476,7 +476,6 @@ const Heap = struct {
 ///   are in the `pages_abandoned` lists of an arena, these are called "mapped" abandoned pages).
 /// - page flags are in the bottom 3 bits of `xthread_id` for the fast path in `mi_free`.
 /// - The layout is optimized for `free.c:mi_free` and `alloc.c:mi_page_alloc`
-// TODO: parameterize by block size and total size?
 const Page = struct {
     _: void align(SIZE) = {},
 
@@ -502,7 +501,6 @@ const Page = struct {
     const SIZE = 1 << 16;
     const DATA_LEN = SIZE - (@sizeOf(Thread.Id) + 8 + 8 + 2 + 8 + 16 + 2);
     const MAX_OBJ_SIZE = DATA_LEN / 8;
-    // TODO: compute this with wsizeOf?
     const MAX_OBJ_WSIZE = MAX_OBJ_SIZE / @sizeOf(usize);
 
     /// Heuristic, one OS page seems to work well.
@@ -512,7 +510,7 @@ const Page = struct {
         assert(@sizeOf(Page) == SIZE);
         assert(@alignOf(Page) == SIZE);
         assert(SIZE % MAX_EXTEND == 0);
-        assert(MAX_OBJ_SIZE <= binBlockSize(Heap.BIN_FULL - 1));
+        assert(MAX_OBJ_SIZE < binBlockSize(Heap.BIN_COUNT - 1));
     }
 
     fn fromPtr(ptr: *anyopaque) *Page {
@@ -588,15 +586,8 @@ const Page = struct {
 /// Pages of a certain block size are held in a queue.
 const PageQueue = struct {
     items: DoublyLinkedList,
-    count: usize,
-    block_size: BlockSize,
-
     // TODO: could store this more compactly like in std.mem.Alignment + std.math.IntFittingRange
-    const BlockSize = enum(usize) {
-        // TODO: should separate out full into separate field?
-        full = Page.MAX_OBJ_SIZE + 1,
-        _,
-    };
+    block_size: usize,
 };
 
 fn isHuge(len: usize, alignment: Alignment) bool {
@@ -621,14 +612,14 @@ fn binIndex(req_wsize: usize) usize {
     //   which each get an exact bin
     // - adjust with 1 because there is no size 0 bin
     const binIdx = ((@as(usize, b) << 2) + ((wsize >> (b - 2)) & 0x03)) - std.math.log2(Heap.EXACT_BINS) - 1;
-    assert(0 < binIdx and binIdx < Heap.BIN_FULL);
+    assert(0 < binIdx and binIdx < Heap.BIN_COUNT);
     assert(req_wsize * @sizeOf(usize) <= binBlockSize(binIdx));
     return binIdx;
 }
 
 /// Return the block size in bytes for a given bin.
 fn binBlockSize(binIdx: usize) usize {
-    assert(binIdx < Heap.BIN_FULL);
+    assert(binIdx < Heap.BIN_COUNT);
 
     const bin = binIdx + 1;
     if (bin < Heap.EXACT_BINS) {
