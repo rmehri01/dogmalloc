@@ -82,6 +82,7 @@ fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
 var page_empty: Page = .{
     .tid = 0,
     .free = .{},
+    .thread_free = .init(null),
     .used = 0,
     .block_size = 0,
     .node = .{},
@@ -162,7 +163,19 @@ const Heap = struct {
             // TODO: free page if used == 0
         } else {
             // non-local free
-            // @panic("handle non-local free");
+            // push atomically on the page thread free list
+            var old = page.thread_free.load(.monotonic);
+            while (true) {
+                block.next = old;
+                if (page.thread_free.cmpxchgWeak(
+                    old,
+                    block,
+                    .acq_rel,
+                    .acquire,
+                )) |current| {
+                    old = current;
+                } else break;
+            }
         }
     }
 
@@ -274,9 +287,11 @@ const Heap = struct {
             // search up to N pages for a best candidate
 
             // is the local free list non-empty?
-            const available = page.immediateAvailable();
+            var available = page.immediateAvailable();
             if (!available) {
-                // TODO: collect freed blocks by us and other threads to we get a proper use count
+                // collect freed blocks by us and other threads to we get a proper use count
+                page.collectFree(false);
+                available = page.immediateAvailable();
             }
 
             // if the page is completely full, move it to `pages_full`
@@ -356,6 +371,7 @@ const Heap = struct {
         page.* = .{
             .tid = Thread.getCurrentId(),
             .free = .{},
+            .thread_free = .init(null),
             .used = 0,
             .block_size = @intFromEnum(pq.block_size),
             .node = .{},
@@ -458,6 +474,8 @@ const Page = struct {
     /// List of available free blocks (`malloc` allocates from this list).
     /// Blocks will be aligned to the greatest power of 2 divisor of `block_size`.
     free: SinglyLinkedList,
+    /// List of deferred free blocks freed by other threads.
+    thread_free: std.atomic.Value(?*SinglyLinkedList.Node),
     /// Number of blocks in use (including blocks in `thread_free`).
     used: u16,
     /// Size available in each block (always `>0`).
@@ -471,7 +489,7 @@ const Page = struct {
 
     // TODO: these and the page constants need to be cleaned up
     const SIZE = 1 << 16;
-    const DATA_LEN = SIZE - (@sizeOf(Thread.Id) + 8 + 2 + 8 + 16 + 2);
+    const DATA_LEN = SIZE - (@sizeOf(Thread.Id) + 8 + 8 + 2 + 8 + 16 + 2);
     const MAX_OBJ_SIZE = DATA_LEN / 8;
     // TODO: compute this with wsizeOf?
     const MAX_OBJ_WSIZE = MAX_OBJ_SIZE / @sizeOf(usize);
@@ -511,7 +529,7 @@ const Page = struct {
     /// Extend the capacity (up to reserved) by initializing a free list.
     /// TODO: We do at most `MAX_EXTEND` to avoid touching too much memory.
     fn extendFree(self: *Page) bool {
-        // TODO: assertion
+        assert(self.free.first == null);
         if (!self.expandable()) return false;
 
         const block_size = self.block_size;
@@ -532,6 +550,27 @@ const Page = struct {
         self.next_idx = self.data.len;
 
         return true;
+    }
+
+    fn collectFree(self: *Page, force: bool) void {
+        _ = force; // autofix
+        // atomically capture the thread free list
+        var head = self.thread_free.load(.monotonic) orelse return;
+        while (true) {
+            if (self.thread_free.cmpxchgWeak(
+                head,
+                null,
+                .acq_rel,
+                .acquire,
+            )) |current| {
+                head = current orelse return;
+            } else break;
+        }
+
+        // and move it to the local list
+        const count: u16 = @intCast(head.countChildren() + 1);
+        self.free.prepend(head);
+        self.used = self.used - count;
     }
 };
 
