@@ -22,9 +22,28 @@ pub const allocator: Allocator = .{
     },
 };
 
-// TODO: deal with threads dying and leaking memory
-// TODO: can probably just make a global like SmpAllocator instead of trying to support separate heaps
-threadlocal var global: Heap = .init();
+var init_heaps = std.once(struct {
+    fn init() void {
+        cpu_count = @intCast(Thread.getCpuCount() catch 128);
+        heaps = std.heap.page_allocator.alloc(Heap, cpu_count * 4) catch @panic("failed to initialize heaps");
+        for (heaps) |*heap| heap.* = .init();
+    }
+}.init);
+var cpu_count: u32 = undefined;
+var heaps: []Heap = undefined;
+var next_idx: std.atomic.Value(u32) = .init(0);
+
+threadlocal var heap_idx: ?u32 = null;
+
+fn getThreadHeap() *Heap {
+    init_heaps.call();
+    const idx = heap_idx orelse idx: {
+        const next = next_idx.fetchAdd(1, .acq_rel) % cpu_count;
+        heap_idx = next;
+        break :idx next;
+    };
+    return &heaps[idx];
+}
 
 fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
     _ = ctx;
@@ -35,7 +54,10 @@ fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
         return PageAllocator.map(len, alignment);
     }
 
-    return global.alloc(len, alignment);
+    const heap = getThreadHeap();
+    heap.lock();
+    defer heap.unlock();
+    return heap.alloc(len, alignment);
 }
 
 fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
@@ -76,12 +98,15 @@ fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
         return PageAllocator.unmap(@alignCast(memory));
     }
 
-    return global.free(memory.ptr);
+    const heap = getThreadHeap();
+    heap.lock();
+    defer heap.unlock();
+    return heap.free(memory.ptr);
 }
 
 // TODO: use null instead of empty page
 var page_empty: Page = .{
-    .tid = 0,
+    .heap_id = 0,
     .free = .{},
     .thread_free = .init(null),
     .used = 0,
@@ -93,6 +118,12 @@ var page_empty: Page = .{
 
 /// A heap owns a set of pages.
 const Heap = struct {
+    /// Avoid false sharing.
+    _: void align(std.atomic.cache_line) = {},
+
+    /// Protects the state in this struct.
+    mutex: std.Thread.Mutex = .{},
+
     // TODO: what fields actually need to be thread local
     /// Optimization: array where every entry points to a page with possibly
     /// free blocks in the corresponding queue for that size.
@@ -133,6 +164,14 @@ const Heap = struct {
         };
     }
 
+    fn lock(self: *Heap) void {
+        self.mutex.lock();
+    }
+
+    fn unlock(self: *Heap) void {
+        self.mutex.unlock();
+    }
+
     /// The main allocation function.
     fn alloc(self: *Heap, len: usize, alignment: Alignment) ?[*]u8 {
         assert(len > 0);
@@ -152,15 +191,21 @@ const Heap = struct {
     /// Free a block.
     fn free(self: *Heap, ptr: *anyopaque) void {
         _ = self; // autofix
-
         const page = Page.fromPtr(ptr);
         const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(ptr));
-        if (page.tid == Thread.getCurrentId()) {
+        if (page.heap_id == heap_idx) {
             // thread-local free
             @branchHint(.likely);
             page.free.prepend(block);
             page.used -= 1;
-            // TODO: free page if used == 0
+            if (page.used == 0) {
+                // const pq = self.pageQueue(page.block_size / @sizeOf(usize));
+                // assert(pq.block_size == page.block_size);
+                // self.pageQueueRemove(pq, page);
+
+                // TODO: slow
+                // std.heap.page_allocator.destroy(page);
+            }
         } else {
             // non-local free
             // push atomically on the page thread free list
@@ -302,7 +347,12 @@ const Heap = struct {
                 // the page has free space, make it a candidate
                 // we prefer non-expandable pages with high usage as candidates (to reduce commit, and increase chances of free-ing up pages)
                 if (candidate) |c| {
-                    // TODO: if used 0, free
+                    if (c.used == 0) {
+                        // TODO: duplicated
+                        // self.pageQueueRemove(pq, c);
+                        // std.heap.page_allocator.destroy(page);
+                        // candidate = page;
+                    }
                     if (page.used >= c.used and !page.isMostlyUsed()) {
                         // prefer to reuse fuller pages (in the hope the less used page gets freed)
                         candidate = page;
@@ -369,7 +419,7 @@ const Heap = struct {
         // TODO: probably move to page.init()
         const page = std.heap.page_allocator.create(Page) catch return null;
         page.* = .{
-            .tid = Thread.getCurrentId(),
+            .heap_id = heap_idx.?,
             .free = .{},
             .thread_free = .init(null),
             .used = 0,
@@ -393,8 +443,12 @@ const Heap = struct {
     }
 
     fn moveToFull(self: *Heap, pq: *PageQueue, page: *Page) void {
-        self.pageQueueRemove(pq, page);
-        self.pages_full.items.append(&page.node);
+        // TODO: add back
+        _ = self; // autofix
+        _ = pq; // autofix
+        _ = page; // autofix
+        // self.pageQueueRemove(pq, page);
+        // self.pages_full.items.append(&page.node);
     }
 
     fn pageQueuePush(self: *Heap, pq: *PageQueue, page: *Page) void {
@@ -421,7 +475,7 @@ const Heap = struct {
         const page: *Page = if (pq.items.first) |node|
             @alignCast(@fieldParentPtr("node", node))
         else
-            return;
+            &page_empty;
 
         // find index in the right direct page array
         const idx = wsizeOf(size, .@"1") - 1;
@@ -432,7 +486,7 @@ const Heap = struct {
         const start = if (bin == 0) 0 else start: {
             // find previous size
             const prev_size = self.pages[bin - 1].block_size;
-            break :start wsizeOf(prev_size, .@"1");
+            break :start wsizeOf(prev_size, .@"1") - 1;
         };
 
         // set size range to the right page
@@ -479,8 +533,8 @@ const Heap = struct {
 const Page = struct {
     _: void align(SIZE) = {},
 
-    /// Thread this page belongs to.
-    tid: Thread.Id,
+    /// Heap this page belongs to.
+    heap_id: u32,
     /// List of available free blocks (`malloc` allocates from this list).
     /// Blocks will be aligned to the greatest power of 2 divisor of `block_size`.
     free: SinglyLinkedList,
@@ -499,7 +553,7 @@ const Page = struct {
 
     // TODO: these and the page constants need to be cleaned up
     const SIZE = 1 << 16;
-    const DATA_LEN = SIZE - (@sizeOf(Thread.Id) + 8 + 8 + 2 + 8 + 16 + 2);
+    const DATA_LEN = SIZE - (4 + 8 + 8 + 2 + 8 + 16 + 2);
     const MAX_OBJ_SIZE = DATA_LEN / 8;
     const MAX_OBJ_WSIZE = MAX_OBJ_SIZE / @sizeOf(usize);
 
@@ -638,25 +692,6 @@ fn binBlockSize(binIdx: usize) usize {
 fn wsizeOf(len: usize, alignment: Alignment) usize {
     const size = alignment.forward(len);
     return std.math.divCeil(usize, size, @sizeOf(usize)) catch unreachable;
-}
-
-// TODO: actual tests
-test {
-    for (1..100) |i| {
-        std.debug.print("{d} bytes: bin {d}\n", .{ i, binIndex(i) });
-    }
-
-    for (global.pages) |p| {
-        std.debug.print("{d}\n", .{p.block_size});
-    }
-
-    const x = allocator.alloc(u8, 128 * 8) catch unreachable;
-    allocator.free(x);
-    const y = allocator.alloc(u8, 128 * 8) catch unreachable;
-    allocator.free(y);
-    const z = allocator.alloc(u8, 128 * 8) catch unreachable;
-    allocator.free(z);
-    std.debug.print("{*} {*} {*}\n", .{ x.ptr, y.ptr, z.ptr });
 }
 
 test "standard allocator tests" {
