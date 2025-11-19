@@ -8,7 +8,7 @@ const Alignment = std.mem.Alignment;
 const assert = std.debug.assert;
 const SinglyLinkedList = std.SinglyLinkedList;
 const DoublyLinkedList = std.DoublyLinkedList;
-const PageAllocator = std.heap.PageAllocator;
+const page_allocator = std.heap.page_allocator;
 
 const log = std.log.scoped(.dogmalloc);
 
@@ -47,11 +47,10 @@ fn getThreadHeap() *Heap {
 
 fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
     _ = ctx;
-    _ = ra;
 
     if (isHuge(len, alignment)) {
         @branchHint(.unlikely);
-        return PageAllocator.map(len, alignment);
+        return page_allocator.rawAlloc(len, alignment, ra);
     }
 
     const heap = getThreadHeap();
@@ -62,12 +61,11 @@ fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
 
 fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) bool {
     _ = ctx;
-    _ = ra;
 
     if (isHuge(memory.len, alignment)) {
         @branchHint(.unlikely);
         if (!isHuge(new_len, alignment)) return false;
-        return PageAllocator.realloc(memory, new_len, false) != null;
+        return page_allocator.rawResize(memory, alignment, new_len, ra);
     }
     // TODO: this is messy
     if (isHuge(new_len, alignment)) return false;
@@ -77,12 +75,11 @@ fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, r
 
 fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra: usize) ?[*]u8 {
     _ = ctx;
-    _ = ra;
 
     if (isHuge(memory.len, alignment)) {
         @branchHint(.unlikely);
         if (!isHuge(new_len, alignment)) return null;
-        return PageAllocator.realloc(memory, new_len, true);
+        return page_allocator.rawRemap(memory, alignment, new_len, ra);
     }
     if (isHuge(new_len, alignment)) return null;
 
@@ -91,11 +88,10 @@ fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ra
 
 fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
     _ = ctx;
-    _ = ra;
 
     if (isHuge(memory.len, alignment)) {
         @branchHint(.unlikely);
-        return PageAllocator.unmap(@alignCast(memory));
+        return page_allocator.rawFree(memory, alignment, ra);
     }
 
     const heap = getThreadHeap();
@@ -138,7 +134,7 @@ const Heap = struct {
     const SMALL_SIZE_MAX = SMALL_WSIZE_MAX * @sizeOf(usize);
 
     const EXACT_BINS = 8;
-    const BIN_COUNT = 36;
+    const BIN_COUNT = 48;
 
     /// We never allocate more than PTRDIFF_MAX (see also <https://sourceware.org/ml/libc-announce/2019/msg00001.html>).
     const MAX_ALLOC_SIZE = std.math.maxInt(isize);
@@ -204,7 +200,7 @@ const Heap = struct {
                 // self.pageQueueRemove(pq, page);
 
                 // TODO: slow
-                // std.heap.page_allocator.destroy(page);
+                // page_allocator.destroy(page);
             }
         } else {
             // non-local free
@@ -350,7 +346,7 @@ const Heap = struct {
                     if (c.used == 0) {
                         // TODO: duplicated
                         // self.pageQueueRemove(pq, c);
-                        // std.heap.page_allocator.destroy(page);
+                        // page_allocator.destroy(page);
                         // candidate = page;
                     }
                     if (page.used >= c.used and !page.isMostlyUsed()) {
@@ -417,7 +413,9 @@ const Heap = struct {
 
         // TODO: better allocation strategy, return proper oom error
         // TODO: probably move to page.init()
-        const page = std.heap.page_allocator.create(Page) catch return null;
+        const page = page_allocator.create(Page) catch return null;
+        assert(std.mem.isAligned(@intFromPtr(page), Page.SIZE));
+        // log.debug("ALLOCATE {*}", .{page});
         page.* = .{
             .heap_id = heap_idx.?,
             .free = .{},
@@ -443,12 +441,8 @@ const Heap = struct {
     }
 
     fn moveToFull(self: *Heap, pq: *PageQueue, page: *Page) void {
-        // TODO: add back
-        _ = self; // autofix
-        _ = pq; // autofix
-        _ = page; // autofix
-        // self.pageQueueRemove(pq, page);
-        // self.pages_full.items.append(&page.node);
+        self.pageQueueRemove(pq, page);
+        self.pages_full.items.append(&page.node);
     }
 
     fn pageQueuePush(self: *Heap, pq: *PageQueue, page: *Page) void {
@@ -479,6 +473,7 @@ const Heap = struct {
 
         // find index in the right direct page array
         const idx = wsizeOf(size, .@"1") - 1;
+        // TODO: can direct just be indexed by bin instead?
         if (self.pages_free_direct[idx] == page) return; // already set
 
         // find start slot
@@ -547,17 +542,18 @@ const Page = struct {
     /// Intrusive doubly linked list, see `PageQueue`.
     node: DoublyLinkedList.Node,
     /// Next index to use when extending the `free` pointers to `data`.
-    next_idx: u16,
+    next_idx: u32,
     /// The actual data that `free` points to.
     data: [DATA_LEN]u8,
 
     // TODO: these and the page constants need to be cleaned up
-    const SIZE = 1 << 16;
-    const DATA_LEN = SIZE - (4 + 8 + 8 + 2 + 8 + 16 + 2);
+    const SIZE = 1 << 19;
+    const DATA_LEN = SIZE - (4 + 8 + 8 + 2 + 8 + 16 + 4);
     const MAX_OBJ_SIZE = DATA_LEN / 8;
     const MAX_OBJ_WSIZE = MAX_OBJ_SIZE / @sizeOf(usize);
 
     /// Heuristic, one OS page seems to work well.
+    // TODO: use std.heap.pageSize
     const MAX_EXTEND = 4 * 1024;
 
     comptime {
@@ -578,7 +574,7 @@ const Page = struct {
 
     // Has the page not yet used up to its reserved space?
     fn expandable(self: *const Page) bool {
-        return self.next_idx < self.data.len;
+        return self.next_idx + self.block_size <= self.data.len;
     }
 
     // Is more than 7/8th of the page in use?
@@ -590,28 +586,28 @@ const Page = struct {
     }
 
     /// Extend the capacity (up to reserved) by initializing a free list.
-    /// TODO: We do at most `MAX_EXTEND` to avoid touching too much memory.
+    /// We usually do at most `MAX_EXTEND` to avoid touching too much memory.
     fn extendFree(self: *Page) bool {
         assert(self.free.first == null);
         if (!self.expandable()) return false;
 
         const block_size = self.block_size;
-        const data = self.data[self.next_idx..];
-        const block_total = data.len / block_size;
-        for (0..block_total - 1) |block_num| {
+        const remaining = self.data[self.next_idx..];
+        const max_extend = if (block_size >= MAX_EXTEND) 1 else MAX_EXTEND / block_size;
+        const extend = @min(remaining.len / block_size, max_extend);
+        const data = remaining[0 .. extend * block_size];
+        for (0..extend - 1) |block_num| {
             const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[block_num * block_size]));
             const next: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[(block_num + 1) * block_size]));
             block.next = next;
         }
 
         const first: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[0]));
-        const last: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[(block_total - 1) * block_size]));
+        const last: *SinglyLinkedList.Node = @ptrCast(@alignCast(&data[(extend - 1) * block_size]));
         last.next = self.free.first;
         self.free.first = first;
 
-        // TODO: dont just initialize whole free list?
-        self.next_idx = self.data.len;
-
+        self.next_idx += @intCast(extend * block_size);
         return true;
     }
 

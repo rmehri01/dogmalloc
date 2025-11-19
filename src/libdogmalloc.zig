@@ -25,7 +25,7 @@ export fn realloc(ptr_opt: ?*anyopaque, len: usize) ?*anyopaque {
         const old = SliceMeta.fromRaw(ptr);
         const old_slice = old.ptr[0..old.len];
 
-        const new_len = len + @sizeOf(usize);
+        const new_len = len + (old.len - old.usableSize(ptr));
         if (allocator.resize(old_slice, new_len)) return ptr;
 
         const new_mem = allocateBytes(
