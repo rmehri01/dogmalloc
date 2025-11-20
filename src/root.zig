@@ -124,6 +124,9 @@ const Heap = struct {
     /// Optimization: prevents full pages from being repeatedly searched in
     /// `pageQueueFindFree`.
     pages_full: DoublyLinkedList,
+    /// List of delayed free blocks freed by other threads to indicate that
+    /// a page is no longer full.
+    delayed_free: std.atomic.Value(?*SinglyLinkedList.Node),
 
     const SMALL_WSIZE_MAX = 128;
     const SMALL_SIZE_MAX = SMALL_WSIZE_MAX * @sizeOf(usize);
@@ -145,6 +148,7 @@ const Heap = struct {
                 break :pages pages;
             },
             .pages_full = .{},
+            .delayed_free = .init(null),
         };
     }
 
@@ -165,34 +169,63 @@ const Heap = struct {
     /// Free a block.
     fn free(self: *Heap, ptr: *anyopaque) void {
         const page = &Page.fromPtr(ptr).meta;
-        const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(ptr));
         if (page.heap_id == heap_idx) {
             // thread-local free
             self.mutex.lock();
             defer self.mutex.unlock();
-
-            page.free.prepend(block);
-            page.used -= 1;
-            if (page.used == 0) {
-                const pq = self.pageQueue(page.block_size / @sizeOf(usize));
-                self.retirePage(pq, page);
-            }
-            // TODO: unfull
+            self.freeLocal(page, ptr);
         } else {
             // non-local free
-            // push atomically on the page thread free list
-            var old = page.thread_free.load(.monotonic);
-            while (true) {
-                block.next = old;
-                if (page.thread_free.cmpxchgWeak(
-                    old,
-                    block,
-                    .acq_rel,
-                    .acquire,
-                )) |current| {
-                    old = current;
-                } else break;
-            }
+            self.freeNonLocal(page, ptr);
+        }
+    }
+
+    /// Regular free of a (thread local) block pointer.
+    fn freeLocal(self: *Heap, page: *Page.Meta, ptr: *anyopaque) void {
+        assert(page.heap_id == heap_idx);
+        const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(ptr));
+
+        page.free.prepend(block);
+        page.used -= 1;
+        const pq = self.pageQueue(page.block_size / @sizeOf(usize));
+        if (page.used == 0) {
+            self.retirePage(pq, page);
+        } else if (page.in_full) {
+            page.in_full = false;
+            page.should_delay.store(false, .release);
+            self.pages_full.remove(&page.node);
+            self.pageQueuePush(pq, page);
+        }
+    }
+
+    /// Free a block pointer owned by another thread.
+    fn freeNonLocal(self: *Heap, page: *Page.Meta, ptr: *anyopaque) void {
+        _ = self;
+        assert(page.heap_id != heap_idx);
+        const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(ptr));
+
+        // Push a block that is owned by another thread on its page-local thread free
+        // list or it's heap delayed free list. Such blocks are later collected by
+        // the owning thread in `allocGeneric`.
+        const free_list = if (page.should_delay.cmpxchgStrong(
+            true,
+            false,
+            .acq_rel,
+            .acquire,
+        ) == null) &heaps[page.heap_id].delayed_free else &page.thread_free;
+
+        // push atomically on the page thread free list
+        var old = free_list.load(.monotonic);
+        while (true) {
+            block.next = old;
+            if (free_list.cmpxchgWeak(
+                old,
+                block,
+                .acq_rel,
+                .acquire,
+            )) |current| {
+                old = current;
+            } else break;
         }
     }
 
@@ -211,7 +244,8 @@ const Heap = struct {
 
     /// Generic allocation routine if the fast path (`allocPage`) does not succeed.
     fn allocGeneric(self: *Heap, wsize: usize) ![*]u8 {
-        // TODO: do administrative tasks every N generic mallocs
+        // do administrative tasks every N generic mallocs
+        self.collectDelayed();
 
         // find (or allocate) a page of the right size
         const page = self.findPage(wsize) catch page: {
@@ -357,8 +391,11 @@ const Heap = struct {
     }
 
     fn moveToFull(self: *Heap, pq: *PageQueue, page: *Page.Meta) void {
+        assert(!page.in_full);
         self.pageQueueRemove(pq, page);
         self.pages_full.append(&page.node);
+        page.in_full = true;
+        page.should_delay.store(true, .release);
     }
 
     /// Retire a page with no more used blocks.
@@ -423,6 +460,29 @@ const Heap = struct {
         _ = force; // autofix
         @panic("todo");
     }
+
+    fn collectDelayed(self: *Heap) void {
+        var head = self.delayed_free.load(.monotonic) orelse return;
+        while (true) {
+            if (self.delayed_free.cmpxchgWeak(
+                head,
+                null,
+                .acq_rel,
+                .acquire,
+            )) |current| {
+                head = current orelse return;
+            } else break;
+        }
+
+        var it: ?*SinglyLinkedList.Node = head;
+        while (it) |node| {
+            const next = node.next; // remember next since it can change
+            defer it = next;
+
+            const page = &Page.fromPtr(node).meta;
+            self.freeLocal(page, node);
+        }
+    }
 };
 
 /// A page contains blocks of one specific size (`block_size`).
@@ -483,6 +543,8 @@ const Page = struct {
             .heap_id = heap_idx.?,
             .free = .{},
             .thread_free = .init(null),
+            .should_delay = .init(false),
+            .in_full = false,
             .used = 0,
             .block_size = block_size,
             .node = .{},
@@ -510,6 +572,12 @@ const Page = struct {
         free: SinglyLinkedList,
         /// List of deferred free blocks freed by other threads.
         thread_free: std.atomic.Value(?*SinglyLinkedList.Node),
+        /// True if the next non-local free should use the `delayed_free` list instead of
+        /// the `thread_free` list.
+        should_delay: std.atomic.Value(bool),
+        /// True if the page is full and resides in the full queue (so we move it to
+        /// a regular queue on free-ing).
+        in_full: bool,
         /// Number of blocks in use (including blocks in `thread_free`).
         used: u16,
         /// Size available in each block (always `>0`).
@@ -555,6 +623,7 @@ const Page = struct {
             const page_size = std.heap.pageSize();
             const max_extend = if (block_size >= page_size) 1 else page_size / block_size;
             const extend = @min(remaining.len / block_size, max_extend);
+            defer assert(self.free.len() == extend);
 
             const data = remaining[0 .. extend * block_size];
             for (0..extend - 1) |block_num| {
@@ -588,9 +657,18 @@ const Page = struct {
             }
 
             // and move it to the local list
-            const count: u16 = @intCast(head.countChildren() + 1);
-            self.free.prepend(head);
-            self.used = self.used - count;
+            var count: u16 = 0;
+            var last = head;
+            while (true) {
+                count += 1;
+                last = last.next orelse break;
+            }
+            assert(count == head.countChildren() + 1);
+            assert(last == head.findLast());
+
+            last.next = self.free.first;
+            self.free.first = head;
+            self.used -= count;
         }
 
         fn blockAlignment(self: *const Meta) Alignment {
