@@ -56,7 +56,19 @@ fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
         ra,
     );
 
-    const heap = getThreadHeap();
+    var heap = getThreadHeap();
+    if (!heap.mutex.tryLock()) {
+        var idx = heap_idx.?;
+        while (true) {
+            idx = (idx + 1) % @as(u32, @intCast(heaps.len));
+            heap = &heaps[idx];
+            if (heap.mutex.tryLock()) {
+                heap_idx = idx;
+                break;
+            }
+        }
+    }
+    defer heap.mutex.unlock();
     return heap.alloc(len, alignment) catch null;
 }
 
@@ -105,8 +117,19 @@ fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
         ra,
     );
 
-    const heap = getThreadHeap();
-    return heap.free(memory.ptr);
+    const ptr = memory.ptr;
+    const page = &Page.fromPtr(ptr).meta;
+    if (page.heap_id == heap_idx) {
+        // thread-local free
+        const heap = getThreadHeap();
+        heap.mutex.lock();
+        defer heap.mutex.unlock();
+
+        heap.freeLocal(page, ptr);
+    } else {
+        // non-local free
+        page.freeNonLocal(ptr);
+    }
 }
 
 /// A heap owns a set of pages.
@@ -155,8 +178,6 @@ const Heap = struct {
     /// The main allocation function.
     fn alloc(self: *Heap, len: usize, alignment: Alignment) ![*]u8 {
         assert(len > 0);
-        self.mutex.lock();
-        defer self.mutex.unlock();
 
         // fast path for small objects
         const wsize = wsizeOf(len, alignment);
@@ -164,20 +185,6 @@ const Heap = struct {
 
         // regular allocation
         return self.allocGeneric(wsize);
-    }
-
-    /// Free a block.
-    fn free(self: *Heap, ptr: *anyopaque) void {
-        const page = &Page.fromPtr(ptr).meta;
-        if (page.heap_id == heap_idx) {
-            // thread-local free
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.freeLocal(page, ptr);
-        } else {
-            // non-local free
-            self.freeNonLocal(page, ptr);
-        }
     }
 
     /// Regular free of a (thread local) block pointer.
@@ -195,37 +202,6 @@ const Heap = struct {
             page.should_delay.store(false, .release);
             self.pages_full.remove(&page.node);
             self.pageQueuePush(pq, page);
-        }
-    }
-
-    /// Free a block pointer owned by another thread.
-    fn freeNonLocal(self: *Heap, page: *Page.Meta, ptr: *anyopaque) void {
-        _ = self;
-        assert(page.heap_id != heap_idx);
-        const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(ptr));
-
-        // Push a block that is owned by another thread on its page-local thread free
-        // list or it's heap delayed free list. Such blocks are later collected by
-        // the owning thread in `allocGeneric`.
-        const free_list = if (page.should_delay.cmpxchgStrong(
-            true,
-            false,
-            .acq_rel,
-            .acquire,
-        ) == null) &heaps[page.heap_id].delayed_free else &page.thread_free;
-
-        // push atomically on the page thread free list
-        var old = free_list.load(.monotonic);
-        while (true) {
-            block.next = old;
-            if (free_list.cmpxchgWeak(
-                old,
-                block,
-                .acq_rel,
-                .acquire,
-            )) |current| {
-                old = current;
-            } else break;
         }
     }
 
@@ -606,6 +582,36 @@ const Page = struct {
             const block_total = DATA_SIZE / self.block_size;
             const frac = block_total / 8;
             return (block_total - self.used) <= frac;
+        }
+
+        /// Free a block pointer owned by another thread.
+        fn freeNonLocal(page: *Page.Meta, ptr: *anyopaque) void {
+            assert(page.heap_id != heap_idx);
+            const block: *SinglyLinkedList.Node = @ptrCast(@alignCast(ptr));
+
+            // Push a block that is owned by another thread on its page-local thread free
+            // list or it's heap delayed free list. Such blocks are later collected by
+            // the owning thread in `allocGeneric`.
+            const free_list = if (page.should_delay.cmpxchgStrong(
+                true,
+                false,
+                .acq_rel,
+                .acquire,
+            ) == null) &heaps[page.heap_id].delayed_free else &page.thread_free;
+
+            // push atomically on the page thread free list
+            var old = free_list.load(.monotonic);
+            while (true) {
+                block.next = old;
+                if (free_list.cmpxchgWeak(
+                    old,
+                    block,
+                    .acq_rel,
+                    .acquire,
+                )) |current| {
+                    old = current;
+                } else break;
+            }
         }
 
         /// Extend the capacity (up to reserved) by initializing a free list.
