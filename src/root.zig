@@ -28,12 +28,11 @@ const Error = error{OutOfMemory};
 var init_heaps = std.once(struct {
     fn init() void {
         // dynamically allocate space for heaps based on number of cpus available
-        cpu_count = @intCast(Thread.getCpuCount() catch 128);
+        const cpu_count = Thread.getCpuCount() catch 128;
         heaps = page_allocator.alloc(Heap, cpu_count * 4) catch @panic("failed to initialize heaps");
         for (heaps) |*heap| heap.* = .init();
     }
 }.init);
-var cpu_count: u32 = undefined;
 var heaps: []Heap = undefined;
 var next_idx: std.atomic.Value(u32) = .init(0);
 
@@ -42,7 +41,8 @@ threadlocal var heap_idx: ?u32 = null;
 fn getThreadHeap() *Heap {
     init_heaps.call();
     const idx = heap_idx orelse idx: {
-        const next = next_idx.fetchAdd(1, .acq_rel) % cpu_count;
+        const num_heaps: u32 = @intCast(heaps.len);
+        const next = next_idx.fetchAdd(1, .acq_rel) % num_heaps;
         heap_idx = next;
         break :idx next;
     };
@@ -62,8 +62,9 @@ fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
     if (!heap.mutex.tryLock()) {
         // if the current heap is busy, try to use another one instead
         var idx = heap_idx.?;
+        const num_heaps: u32 = @intCast(heaps.len);
         while (true) {
-            idx = (idx + 1) % @as(u32, @intCast(heaps.len));
+            idx = (idx + 1) % num_heaps;
             heap = &heaps[idx];
             if (heap.mutex.tryLock()) {
                 heap_idx = idx;

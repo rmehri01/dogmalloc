@@ -26,7 +26,10 @@ export fn realloc(ptr_opt: ?*anyopaque, len: usize) ?*anyopaque {
         const old_slice = old.ptr[0..old.len];
 
         const new_len = len + (old.len - old.usableSize(ptr));
-        if (allocator.resize(old_slice, new_len)) return ptr;
+        if (allocator.resize(old_slice, new_len)) {
+            old.len = new_len;
+            return ptr;
+        }
 
         const new_mem = allocateBytes(
             len,
@@ -115,8 +118,11 @@ const SliceMeta = struct {
     ptr: [*]u8,
     len: usize,
 
-    fn fromRaw(ptr: *const anyopaque) SliceMeta {
-        return std.mem.bytesToValue(SliceMeta, @as([*]const u8, @ptrCast(ptr)) - @sizeOf(SliceMeta));
+    fn fromRaw(ptr: *anyopaque) *SliceMeta {
+        return @alignCast(std.mem.bytesAsValue(
+            SliceMeta,
+            @as([*]u8, @ptrCast(ptr)) - @sizeOf(SliceMeta),
+        ));
     }
 
     fn usableSize(self: *const SliceMeta, ptr: *const anyopaque) usize {
