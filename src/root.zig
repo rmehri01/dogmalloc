@@ -154,6 +154,9 @@ const Heap = struct {
     /// List of delayed free blocks, freed by other threads to indicate that
     /// a page is no longer full.
     delayed_free: std.atomic.Value(?*SinglyLinkedList.Node),
+    /// Tracks how many generic allocations have been done since last doing
+    /// maintenance work.
+    generic_count: u7,
 
     const SMALL_WSIZE_MAX = 128;
     const SMALL_SIZE_MAX = SMALL_WSIZE_MAX * @sizeOf(usize);
@@ -176,6 +179,7 @@ const Heap = struct {
             },
             .pages_full = .{},
             .delayed_free = .init(null),
+            .generic_count = 0,
         };
     }
 
@@ -217,8 +221,10 @@ const Heap = struct {
 
     /// Generic allocation routine if the fast path (`allocPage`) does not succeed.
     fn allocGeneric(self: *Heap, wsize: usize) ![*]u8 {
-        // do administrative tasks
-        self.collectDelayed();
+        // do administrative tasks every N generic allocations
+        self.generic_count +%= 1;
+        if (self.generic_count == std.math.maxInt(@TypeOf(self.generic_count)))
+            self.collectDelayed();
 
         // find (or allocate) a page of the right size
         const page = try self.findPage(wsize);
@@ -266,19 +272,11 @@ const Heap = struct {
 
     /// Find a page with free blocks of `pq.block_size`.
     fn pageQueueFindFree(self: *Heap, pq: *PageQueue) !*Page.Meta {
-        // search up to `MAX_CANDIDATES` pages for a best candidate
-        const MAX_CANDIDATES = 4;
-
         // search through the pages in "next fit" order
-        var candidate: ?*Page.Meta = null;
         var node = pq.items.first;
         var next: ?*DoublyLinkedList.Node = null;
-        var candidate_limit: ?std.math.IntFittingRange(0, MAX_CANDIDATES) = null;
 
-        while (node) |n| : ({
-            node = next;
-            if (candidate_limit) |*c| c.* -|= 1;
-        }) {
+        const page = while (node) |n| : (node = next) {
             const page: *Page.Meta = @fieldParentPtr("node", n);
             next = n.next; // remember next (as this page can move to another queue)
 
@@ -288,43 +286,28 @@ const Heap = struct {
                 page.collectFree();
             }
 
-            // if the page is completely full, move it to `pages_full`
-            // queue so we don't visit long-lived pages too often.
             if (page.isFull()) {
+                // if the page is completely full, move it to `pages_full`
+                // queue so we don't visit long-lived pages too often.
                 self.moveToFull(pq, page);
                 continue;
+            } else {
+                // we found a non-full candidate
+                break page;
             }
+        } else return self.pageFresh(pq);
 
-            // the page has free space, make it a candidate
-            // we prefer non-expandable pages
-            if (candidate == null) {
-                candidate_limit = MAX_CANDIDATES;
-                candidate = page;
-            }
-
-            // if we find a non-expandable candidate, or searched for N pages, return
-            // with the best candidate
-            if (page.immediateAvailable() or candidate_limit == 0) {
-                assert(candidate != null);
-                break;
-            }
+        if (!page.immediateAvailable()) {
+            assert(page.expandable());
+            page.extendFree();
         }
+        assert(page.immediateAvailable());
 
-        if (candidate) |page| {
-            if (!page.immediateAvailable()) {
-                assert(page.expandable());
-                page.extendFree();
-            }
-            assert(page.immediateAvailable());
+        // move the page to the front of the queue
+        self.pageQueueRemove(pq, page);
+        self.pageQueuePush(pq, page);
 
-            // move the page to the front of the queue
-            self.pageQueueRemove(pq, page);
-            self.pageQueuePush(pq, page);
-
-            return page;
-        } else {
-            return self.pageFresh(pq);
-        }
+        return page;
     }
 
     /// Get a fresh page to use.
