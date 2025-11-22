@@ -397,7 +397,7 @@ const Heap = struct {
             head,
             null,
             .acq_rel,
-            .acquire,
+            .monotonic,
         )) |current| {
             head = current orelse return;
         } else break;
@@ -536,7 +536,7 @@ const Page = struct {
                 true,
                 false,
                 .acq_rel,
-                .acquire,
+                .monotonic,
             ) == null) &heaps[page.heap_id].delayed_free else &page.thread_free;
 
             // push atomically on the page thread free list
@@ -547,7 +547,7 @@ const Page = struct {
                     old,
                     block,
                     .acq_rel,
-                    .acquire,
+                    .monotonic,
                 )) |current| {
                     old = current;
                 } else break;
@@ -596,7 +596,7 @@ const Page = struct {
                 head,
                 null,
                 .acq_rel,
-                .acquire,
+                .monotonic,
             )) |current| {
                 head = current orelse return;
             } else break;
