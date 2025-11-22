@@ -59,20 +59,20 @@ fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ra: usize) ?[*]u8 {
     );
 
     var heap = getThreadHeap();
-    if (!heap.mutex.tryLock()) {
+    if (!heap.mutex.tryAcquire()) {
         // if the current heap is busy, try to use another one instead
         var idx = heap_idx.?;
         const num_heaps: u32 = @intCast(heaps.len);
         while (true) {
             idx = (idx + 1) % num_heaps;
             heap = &heaps[idx];
-            if (heap.mutex.tryLock()) {
+            if (heap.mutex.tryAcquire()) {
                 heap_idx = idx;
                 break;
             }
         }
     }
-    defer heap.mutex.unlock();
+    defer heap.mutex.release();
     return heap.alloc(len, alignment) catch null;
 }
 
@@ -126,8 +126,8 @@ fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
     if (page.heap_id == heap_idx) {
         // thread-local free
         const heap = getThreadHeap();
-        heap.mutex.lock();
-        defer heap.mutex.unlock();
+        heap.mutex.acquire();
+        defer heap.mutex.release();
 
         heap.freeLocal(page, ptr);
     } else {
@@ -136,13 +136,33 @@ fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ra: usize) void {
     }
 }
 
+/// Spin lock. Seems to perform better than std.Thread.Mutex on many benchmarks.
+pub const Lock = enum {
+    unlocked,
+    locked,
+
+    pub fn tryAcquire(lock: *Lock) bool {
+        return @cmpxchgStrong(Lock, lock, .unlocked, .locked, .acquire, .monotonic) == null;
+    }
+
+    pub fn acquire(lock: *Lock) void {
+        while (@cmpxchgWeak(Lock, lock, .unlocked, .locked, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn release(lock: *Lock) void {
+        @atomicStore(Lock, lock, .unlocked, .release);
+    }
+};
+
 /// A heap owns a set of pages.
 const Heap = struct {
     /// Avoid false sharing.
     _: void align(std.atomic.cache_line) = {},
 
     /// Protects the state in this struct.
-    mutex: std.Thread.Mutex = .{},
+    mutex: Lock = .unlocked,
     /// Queue of pages for each size class (or "bin").
     pages: [BIN_COUNT]PageQueue,
     /// Optimization: array where every entry points to a page with possibly
